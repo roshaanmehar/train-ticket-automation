@@ -197,3 +197,13 @@ Run testSearchWithoutProcessing() to check the attachment names
 Want to re-run everything
 
 Run:
+resetProcessedEmails()
+Then run the collector again.
+
+Why This Exists (In One Sentence)
+I built this because manually saving train receipts was annoying, and this is the kind of boring repetitive task computers should be doing instead of humans.
+
+Licence
+This project is provided as-is for personal use.
+Modify it freely to fit your own workflow.
+
