@@ -324,3 +324,25 @@ function testSearchWithoutProcessing() {
   }
 }
 
+// ============================================================
+// UTILITY: Reprocess all emails (removes the processed label)
+// ============================================================
+
+function resetProcessedEmails() {
+  var label = GmailApp.getUserLabelByName(CONFIG.processedLabelName);
+  if (!label) {
+    Logger.log("No processed label found. Nothing to reset.");
+    return;
+  }
+
+  var threads = label.getThreads();
+  for (var t = 0; t < threads.length; t++) {
+    threads[t].removeLabel(label);
+  }
+
+  Logger.log(
+    "Reset complete. Removed processed label from " +
+      threads.length +
+      " thread(s). Run collectAttachments() again to reprocess."
+  );
+}
