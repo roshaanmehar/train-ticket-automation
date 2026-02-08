@@ -259,3 +259,24 @@ function padZero(num) {
   return num < 10 ? "0" + num : num.toString();
 }
 
+// ============================================================
+// SETUP FUNCTION - Run this ONCE to create the daily trigger
+// ============================================================
+
+function setupDailyTrigger() {
+  // Remove any existing triggers for this function first
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "collectAttachments") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+
+  // Create a new daily trigger that runs between 8-9 AM
+  ScriptApp.newTrigger("collectAttachments").timeBased().everyDays(1).atHour(8).create();
+
+  Logger.log(
+    "Daily trigger created! The script will run automatically every day between 8-9 AM."
+  );
+}
+
