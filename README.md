@@ -53,3 +53,8 @@ This script automatically:
 
 It creates a Drive structure like this:
 
+Train Tickets /
+2026 /
+February /
+Feb - Sat - 07-02-2026.pdf
+Feb - Mon - 10-02-2026.pdf
