@@ -179,3 +179,21 @@ Google Drive automatically zips all PDFs into a single download.
 
 ```js
 receiptKeyword: ""
+
+
+Troubleshooting
+Emails not being found
+
+Confirm the sender email is correct in the CONFIG
+
+Make sure you're using the same Google account that receives the ticket emails
+
+Emails found but no receipts saved
+
+The attachment may not contain the keyword "receipt"
+
+Run testSearchWithoutProcessing() to check the attachment names
+
+Want to re-run everything
+
+Run:
