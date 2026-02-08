@@ -280,3 +280,47 @@ function setupDailyTrigger() {
   );
 }
 
+// ============================================================
+// UTILITY: Run this to test without marking emails as processed
+// ============================================================
+
+function testSearchWithoutProcessing() {
+  var query = "from:" + CONFIG.senderEmail + " has:attachment";
+  var threads = GmailApp.search(query);
+
+  Logger.log("Total matching emails with attachments: " + threads.length);
+
+  for (var t = 0; t < threads.length; t++) {
+    var messages = threads[t].getMessages();
+    for (var m = 0; m < messages.length; m++) {
+      var message = messages[m];
+      var subject = message.getSubject();
+      var body = (message.getPlainBody() || "").toLowerCase();
+      var content = ((subject || "") + " " + body).toLowerCase();
+
+      var keywordMatch = !isKeywordFilterEnabled()
+        ? "N/A (disabled)"
+        : (content.indexOf(CONFIG.keywordA.toLowerCase()) !== -1 &&
+           content.indexOf(CONFIG.keywordB.toLowerCase()) !== -1
+          ? "YES"
+          : "NO");
+
+      var attachments = message.getAttachments();
+      var attachmentNames = [];
+      for (var a = 0; a < attachments.length; a++) {
+        attachmentNames.push(
+          attachments[a].getName() + " (" + attachments[a].getContentType() + ")"
+        );
+      }
+
+      Logger.log(
+        "---\n" +
+          "Subject: " + subject + "\n" +
+          "Date: " + message.getDate() + "\n" +
+          "Keyword match: " + keywordMatch + "\n" +
+          "Attachments: " + attachmentNames.join(", ")
+      );
+    }
+  }
+}
+
