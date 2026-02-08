@@ -152,3 +152,30 @@ Run:
 
 
 setupDailyTrigger()
+
+
+This creates a daily trigger (default runs around 8 AM).
+
+---
+
+## Downloading Receipts at End of Month
+
+At the end of the month, I just:
+
+- Open Google Drive
+- Go into the folder for the correct year/month
+- Right-click the folder
+- Click **Download**
+
+Google Drive automatically zips all PDFs into a single download.
+
+---
+
+## Notes
+
+- The script avoids re-downloading by applying a Gmail label after processing.
+- If TrainPal (or the ticket provider) changes their email format or attachment names, the keyword filters may need updating.
+- If you want to capture all PDFs regardless of filename, set:
+
+```js
+receiptKeyword: ""
