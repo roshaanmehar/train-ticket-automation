@@ -134,3 +134,128 @@ function collectAttachments() {
   Logger.log("Done! Saved " + savedCount + " PDF file(s) to Google Drive.");
 }
 
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+/**
+ * Returns true if both keywords are set (non-empty).
+ */
+function isKeywordFilterEnabled() {
+  return (
+    CONFIG.keywordA &&
+    CONFIG.keywordB &&
+    CONFIG.keywordA.toString().trim() !== "" &&
+    CONFIG.keywordB.toString().trim() !== ""
+  );
+}
+
+/**
+ * Builds a file name like: Feb - Sat - 07-02-2026.pdf
+ */
+function buildFileName(date) {
+  var shortMonth = getShortMonthName(date.getMonth());
+  var shortDay = getShortDayName(date.getDay());
+  var dayNum = padZero(date.getDate());
+  var monthNum = padZero(date.getMonth() + 1);
+  var year = date.getFullYear();
+
+  return (
+    shortMonth +
+    " - " +
+    shortDay +
+    " - " +
+    dayNum +
+    "-" +
+    monthNum +
+    "-" +
+    year +
+    ".pdf"
+  );
+}
+
+/**
+ * If a file with this name already exists in the folder,
+ * appends (2), (3), etc. to make it unique.
+ */
+function getUniqueFileName(folder, fileName) {
+  var baseName = fileName.replace(".pdf", "");
+  var candidate = fileName;
+  var counter = 2;
+
+  while (folder.getFilesByName(candidate).hasNext()) {
+    candidate = baseName + " (" + counter + ").pdf";
+    counter++;
+  }
+
+  return candidate;
+}
+
+/**
+ * Gets or creates a Gmail label.
+ */
+function getOrCreateLabel(labelName) {
+  var label = GmailApp.getUserLabelByName(labelName);
+  if (!label) {
+    label = GmailApp.createLabel(labelName);
+    Logger.log('Created Gmail label: "' + labelName + '"');
+  }
+  return label;
+}
+
+/**
+ * Gets or creates a folder inside a parent folder (or root of Drive if parent is null).
+ */
+function getOrCreateFolder(parentFolder, folderName) {
+  var folders;
+  if (parentFolder) {
+    folders = parentFolder.getFoldersByName(folderName);
+  } else {
+    folders = DriveApp.getFoldersByName(folderName);
+  }
+
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+
+  if (parentFolder) {
+    Logger.log('Created folder: "' + folderName + '"');
+    return parentFolder.createFolder(folderName);
+  } else {
+    Logger.log('Created root folder: "' + folderName + '"');
+    return DriveApp.createFolder(folderName);
+  }
+}
+
+function getMonthName(monthIndex) {
+  var months = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+  return months[monthIndex];
+}
+
+function getShortMonthName(monthIndex) {
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return months[monthIndex];
+}
+
+function getShortDayName(dayIndex) {
+  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return days[dayIndex];
+}
+
+function padZero(num) {
+  return num < 10 ? "0" + num : num.toString();
+}
+
