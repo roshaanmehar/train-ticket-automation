@@ -131,3 +131,5 @@ Edit the `CONFIG` section at the top of the script:
 
 Run:
 
+testSearchWithoutProcessing()
+
