@@ -133,3 +133,10 @@ Run:
 
 testSearchWithoutProcessing()
 
+
+This will list emails found and show whether they match the route filter.
+
+### 4. Run it for real
+
+Run:
+
