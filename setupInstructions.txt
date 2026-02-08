@@ -1,0 +1,199 @@
+================================================================
+  EMAIL ATTACHMENT COLLECTOR - SETUP GUIDE
+  (Estimated time: 5 minutes)
+================================================================
+
+WHAT THIS DOES:
+  Every day, this script checks your Gmail for emails from a
+  specific sender, optionally filters for messages containing
+  two keywords (e.g. a route or topic), downloads matching PDF
+  attachments (optionally filtered by filename keyword), and
+  saves them into Google Drive in organised folders like:
+
+    Email Attachments / 2026 / February / Feb - Sat - 07-02-2026.pdf
+
+  At the end of the month, you can download the folder and
+  share it with whoever needs the documents.
+
+
+================================================================
+STEP 1: OPEN GOOGLE APPS SCRIPT
+================================================================
+
+  1. Open your web browser (Chrome recommended)
+  2. Go to: https://script.google.com
+  3. Sign in with the SAME Google account that has access to
+     the Gmail inbox you want to monitor
+  4. Click the "+ New project" button
+
+
+================================================================
+STEP 2: PASTE THE SCRIPT
+================================================================
+
+  1. You’ll see a code editor with some default text like:
+       function myFunction() { }
+  2. DELETE all of that text (select all, then delete)
+  3. Open the script file you intend to use (for example:
+     "AttachmentCollector.gs")
+  4. Copy EVERYTHING in that file (Ctrl+A, then Ctrl+C)
+  5. Paste it into the Google Apps Script editor (Ctrl+V)
+  6. Click the floppy disk icon (or Ctrl+S) to save
+  7. Optional: rename the project by clicking "Untitled project"
+     at the top and typing something like:
+       "Email Attachment Collector"
+
+
+================================================================
+STEP 3: TEST THE SEARCH (without saving anything yet)
+================================================================
+
+  This step lets you verify the script can find relevant emails
+  before it starts saving files.
+
+  1. In the editor’s top toolbar, find the function dropdown
+     (it will show a function name) and click it
+  2. Select the test function (for example):
+       testSearchWithoutProcessing
+  3. Click the "Run" button (play/triangle icon)
+  4. A popup may appear saying "Authorisation required"
+     -- click "Review permissions"
+  5. Select your Google account
+  6. You may see a "Google hasn’t verified this app" warning:
+     a. Click "Advanced"
+     b. Click "Go to [project name] (unsafe)"
+     c. Click "Allow"
+     (This is expected for personal Apps Script projects.)
+
+  7. The script will run. Look at the bottom of the screen for
+     the "Execution log" panel
+  8. You should see a list of emails, showing:
+     - Subject line
+     - Date
+     - Whether it matched the keyword filter (YES/NO, if enabled)
+     - Attachment names and types
+
+  CHECK THE OUTPUT:
+    - Do you see emails listed?
+    - If you enabled keyword filtering, do relevant emails show
+      "Keyword match: YES"?
+    - Is there a PDF attachment matching your attachment-name
+      keyword (if enabled)?
+
+  If attachment names don’t include your expected word, edit the
+  CONFIG section in the script:
+    attachmentNameKeyword: "receipt"
+  Change "receipt" to a keyword that appears in your attachment
+  filenames, or set it to "" to save ALL PDF attachments.
+
+
+================================================================
+STEP 4: RUN IT FOR REAL (first time)
+================================================================
+
+  1. Change the function dropdown back to the main function
+     (for example):
+       collectAttachments
+  2. Click "Run"
+  3. Wait for it to finish (check the execution log)
+  4. Open Google Drive: https://drive.google.com
+  5. You should see a new folder (for example "Email Attachments")
+     with your PDFs organised inside
+
+
+================================================================
+STEP 5: SET UP THE DAILY AUTO-RUN
+================================================================
+
+  This makes it run every day automatically.
+
+  1. Change the function dropdown to:
+       setupDailyTrigger
+  2. Click "Run"
+  3. Done — the script will now run automatically every day
+     around the configured hour.
+
+  To verify the trigger was created:
+  1. Click the clock icon on the left sidebar ("Triggers")
+  2. You should see one trigger listed for the main collection
+     function, set to run daily
+
+
+================================================================
+STEP 6: DOWNLOADING AT END OF MONTH
+================================================================
+
+  When you need to export the saved PDFs:
+
+  1. Go to Google Drive: https://drive.google.com
+  2. Open: [Root Folder] > [Year] > [Month]
+     For example: Email Attachments > 2026 > February
+  3. Right-click the month folder (e.g. "February")
+  4. Click "Download"
+  5. Google Drive will zip all the PDFs into one file and
+     download it to your computer
+  6. Share the zip file (or extract and share the PDFs) as needed
+
+
+================================================================
+TROUBLESHOOTING
+================================================================
+
+  "I don't see any emails being found"
+    - Make sure you’re signed into the Google account that has
+      access to the inbox you want to monitor
+    - Check the sender email in the CONFIG matches the actual
+      sender address for the emails you want to capture
+
+  "Emails are found but no PDFs are saved"
+    - The keyword filter might not be matching (if enabled).
+      Run the test function and check whether "Keyword match"
+      says YES for relevant emails
+    - The attachment-name keyword might not match (if enabled).
+      Check actual attachment filenames and update
+      attachmentNameKeyword, or set it to "" to save all PDFs
+
+  "I want to reprocess emails that were already processed"
+    - Run:
+        resetProcessedEmails
+    - Then run the main collection function again
+
+  "I want to stop the daily auto-run"
+    - Click the clock icon on the left sidebar ("Triggers")
+    - Click the three dots on the trigger
+    - Click "Delete trigger"
+
+  "I accidentally ran it twice and got duplicate files"
+    - The script applies a processed label so it should not
+      reprocess the same threads.
+    - If duplicates exist, delete them from Drive, run
+      resetProcessedEmails, then run the main function again.
+
+
+================================================================
+OPTIONAL: SYNC TO A DESKTOP COMPUTER
+================================================================
+
+  If you want the Drive folder to appear on your computer as a
+  regular folder:
+
+  1. Install Google Drive for desktop:
+     https://www.google.com/drive/download/
+  2. Sign in with your Google account
+  3. Your Drive folders will appear in your file explorer
+     (location depends on your operating system settings)
+  4. New PDFs saved by the script will sync automatically
+
+
+================================================================
+DONE
+================================================================
+
+  Summary:
+  - A script that runs daily
+  - Checks Gmail for new matching emails
+  - Saves matching PDF attachments to Google Drive, organised
+  - You download the monthly folder when needed
+
+  You only need to revisit Google Apps Script if something
+  changes (e.g. sender address, email format, or attachment names).
