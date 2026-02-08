@@ -140,3 +140,15 @@ This will list emails found and show whether they match the route filter.
 
 Run:
 
+collectTrainTickets()
+
+
+Receipts will be saved into Google Drive.
+
+### 5. Set up daily automation
+
+Run:
+
+
+
+setupDailyTrigger()
