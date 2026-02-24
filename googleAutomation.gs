@@ -8,13 +8,15 @@
 //   2) FALLBACK: parse travel date from EMAIL body/subject
 //   3) FINAL fallback: email sent date
 //
-// Repair/Backfill mode:
+// Backfill mode:
 //   - Does NOT create any "Reconciled" folder.
-//   - Saves into your existing normal structure:
+//   - Saves into existing normal structure:
 //       Train Tickets / YYYY / MonthName
-//   - Can target:
-//       A) previous calendar month, or
-//       B) from the 1st of the current month
+//
+// Logging:
+//   - Emits per-thread + per-message summaries
+//   - Emits per-attachment saved/skipped with reasons
+//   - Emits final counters + a “saved map” of email -> files
 // ============================================================
 
 // ----- CONFIGURATION -----
@@ -27,20 +29,31 @@ var CONFIG = {
   routeKeywordA: "leeds",
   routeKeywordB: "hull",
 
-  // Only save PDF attachments containing this word in filename.
-  // Set to "" to save all PDF attachments from matching emails.
+  // Daily collector: only save PDFs containing this word in filename.
+  // Set to "" to save ALL PDFs from matching emails.
   receiptKeyword: "receipt",
 
   // -------------------------------
   // BACKFILL / REPAIR CONTROLS
   // -------------------------------
   // Choose ONE:
-  //   "PREVIOUS_MONTH"  -> only tickets whose parsed travel date falls in previous month
-  //   "CURRENT_MONTH"   -> only tickets whose parsed travel date falls in current month
-  //
-  // And: how far back Gmail should be searched (performance guard).
-  backfillMode: "PREVIOUS_MONTH", // <-- change to "CURRENT_MONTH" if wanted
-  backfillSearchDaysBack: 120,     // <-- adjust if you book further ahead
+  //   "PREVIOUS_MONTH" -> only tickets whose parsed travel date falls in previous month
+  //   "CURRENT_MONTH"  -> only tickets whose parsed travel date falls in current month
+  backfillMode: "CURRENT_MONTH",
+
+  // How far back Gmail should be searched (performance guard)
+  backfillSearchDaysBack: 180,
+
+  // Backfill attachment behaviour:
+  //   "RECEIPTS_ONLY" -> honour receiptKeyword filter
+  //   "ALL_PDFS"      -> ignore receiptKeyword and save all PDF attachments
+backfillAttachmentMode: "RECEIPTS_ONLY",
+
+  // Gmail search pagination
+  pageSize: 100,
+
+  // Set true to log the first ~300 chars of email body (useful when date parsing fails)
+  logBodySnippet: false,
 };
 
 // ============================================================
@@ -57,106 +70,157 @@ function collectTrainTickets() {
     CONFIG.processedLabelName +
     " has:attachment";
 
-  var threads = GmailApp.search(query);
+  Logger.log("=== collectTrainTickets() starting ===");
+  Logger.log("Gmail query: " + query);
 
-  if (threads.length === 0) {
-    Logger.log("No new TrainPal emails found.");
-    return;
-  }
+  var start = 0;
+  var totalThreads = 0;
+  var totalMessages = 0;
 
-  Logger.log("Found " + threads.length + " new email thread(s) to process.");
+  var counters = makeCounters_();
+  var savedMap = {}; // messageId -> {subject, date, saved:[...], skipped:[...]}
 
-  var savedCount = 0;
+  while (true) {
+    var threads = GmailApp.search(query, start, CONFIG.pageSize);
+    if (!threads || threads.length === 0) break;
 
-  for (var t = 0; t < threads.length; t++) {
-    var messages = threads[t].getMessages();
+    totalThreads += threads.length;
+    Logger.log("Page: start=" + start + " threads=" + threads.length);
 
-    for (var m = 0; m < messages.length; m++) {
-      var message = messages[m];
-      var subject = (message.getSubject() || "").toLowerCase();
-      var body = (message.getPlainBody() || "").toLowerCase();
-      var content = subject + " " + body;
+    for (var t = 0; t < threads.length; t++) {
+      var thread = threads[t];
+      var messages = thread.getMessages();
+      counters.threadsScanned++;
 
-      // Route filter
-      if (
-        content.indexOf(CONFIG.routeKeywordA) === -1 ||
-        content.indexOf(CONFIG.routeKeywordB) === -1
-      ) {
-        Logger.log("Skipping email (route filter): " + message.getSubject());
-        continue;
-      }
+      Logger.log("---- Thread #" + counters.threadsScanned + " messages=" + messages.length + " ----");
 
-      var messageDate = message.getDate();
-      var attachments = message.getAttachments();
+      for (var m = 0; m < messages.length; m++) {
+        var message = messages[m];
+        totalMessages++;
+        counters.messagesScanned++;
 
-      for (var a = 0; a < attachments.length; a++) {
-        var attachment = attachments[a];
-        var attachmentNameLower = (attachment.getName() || "").toLowerCase();
+        var subjectRaw = message.getSubject() || "";
+        var subject = subjectRaw.toLowerCase();
+        var bodyRaw = message.getPlainBody() || "";
+        var body = bodyRaw.toLowerCase();
+        var content = subject + " " + body;
 
-        if (attachment.getContentType() !== "application/pdf") continue;
+        var msgDate = message.getDate();
+        var msgId = safeMessageId_(message);
 
+        ensureSavedMap_(savedMap, msgId, subjectRaw, msgDate);
+
+        Logger.log(
+          "[Message] id=" + msgId +
+          " date=" + msgDate +
+          " subject=\"" + subjectRaw + "\""
+        );
+
+        if (CONFIG.logBodySnippet) {
+          Logger.log("[Body snippet] " + bodyRaw.substring(0, 300).replace(/\s+/g, " "));
+        }
+
+        // Route filter
         if (
-          CONFIG.receiptKeyword &&
-          attachmentNameLower.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1
+          content.indexOf(CONFIG.routeKeywordA) === -1 ||
+          content.indexOf(CONFIG.routeKeywordB) === -1
         ) {
-          Logger.log(
-            'Skipping attachment (no "' +
-              CONFIG.receiptKeyword +
-              '" in name): ' +
-              attachment.getName()
-          );
+          counters.skippedRoute++;
+          savedMap[msgId].skipped.push("Skipped message (route filter)");
+          Logger.log("  -> SKIP message: route keywords missing (" + CONFIG.routeKeywordA + ", " + CONFIG.routeKeywordB + ")");
           continue;
         }
 
-        // Travel date resolution:
-        var travelDate =
-          extractTravelDateFromAttachmentName_(attachment.getName(), messageDate) ||
-          extractTravelDateFromEmail_(message) ||
-          messageDate;
+        var attachments = message.getAttachments();
+        Logger.log("  Attachments: " + attachments.length);
 
-        // Normal folder path: Train Tickets / YYYY / MonthName
-        var yearFolder = getOrCreateFolderSmart_(
-          rootFolder,
-          travelDate.getFullYear().toString()
-        );
-        var monthName = getMonthName_(travelDate.getMonth());
-        var monthFolder = getOrCreateFolderSmart_(yearFolder, monthName);
+        for (var a = 0; a < attachments.length; a++) {
+          var att = attachments[a];
+          var attName = att.getName() || "(no name)";
+          var attNameLower = attName.toLowerCase();
+          var attType = att.getContentType();
 
-        // Normal file name
-        var fileName = buildFileName_(travelDate);
-        fileName = getUniqueFileName_(monthFolder, fileName);
+          // Only PDF
+          if (attType !== "application/pdf") {
+            counters.skippedNonPdf++;
+            savedMap[msgId].skipped.push(attName + " (non-PDF: " + attType + ")");
+            Logger.log("  -> SKIP attachment: " + attName + " (non-PDF: " + attType + ")");
+            continue;
+          }
 
-        monthFolder.createFile(attachment.copyBlob().setName(fileName));
-        savedCount++;
-        Logger.log("Saved: " + fileName + " to " + monthName + "/");
+          // Receipt keyword filter (collector only)
+          if (CONFIG.receiptKeyword && attNameLower.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1) {
+            counters.skippedKeyword++;
+            savedMap[msgId].skipped.push(attName + " (missing keyword: " + CONFIG.receiptKeyword + ")");
+            Logger.log("  -> SKIP attachment: " + attName + " (missing keyword: " + CONFIG.receiptKeyword + ")");
+            continue;
+          }
+
+          // Resolve travel date + record which method was used
+          var travelInfo = resolveTravelDateWithSource_(attName, message, msgDate);
+          var travelDate = travelInfo.date;
+          var dateSource = travelInfo.source;
+
+          // Folder path
+          var yearFolder = getOrCreateFolderSmart_(rootFolder, travelDate.getFullYear().toString());
+          var monthName = getMonthName_(travelDate.getMonth());
+          var monthFolder = getOrCreateFolderSmart_(yearFolder, monthName);
+
+          // File name (unique)
+          var fileName = buildFileName_(travelDate);
+          var uniqueNameInfo = getUniqueFileNameWithInfo_(monthFolder, fileName);
+
+          // Save
+          monthFolder.createFile(att.copyBlob().setName(uniqueNameInfo.name));
+          counters.saved++;
+          if (uniqueNameInfo.wasDuplicate) counters.duplicatesRenamed++;
+
+          var saveLine =
+            uniqueNameInfo.name +
+            " -> " +
+            CONFIG.rootFolderName + "/" + travelDate.getFullYear() + "/" + monthName +
+            " (travelDateSource=" + dateSource + ", originalAttachment=\"" + attName + "\"" +
+            (uniqueNameInfo.wasDuplicate ? ", dedupFrom=\"" + fileName + "\"" : "") +
+            ")";
+
+          savedMap[msgId].saved.push(saveLine);
+
+          Logger.log("  -> SAVED: " + saveLine);
+        }
       }
+
+      // Mark the whole thread processed after scanning its messages
+      thread.addLabel(label);
+      counters.threadsLabelled++;
+      Logger.log("---- Thread labelled: " + CONFIG.processedLabelName + " ----");
     }
 
-    // Mark processed
-    threads[t].addLabel(label);
+    start += CONFIG.pageSize;
   }
 
-  Logger.log("Done! Saved " + savedCount + " receipt(s) to Google Drive.");
+  Logger.log("=== collectTrainTickets() finished ===");
+  logCounters_(counters, totalThreads, totalMessages);
+  logSavedMap_(savedMap);
 }
 
 // ============================================================
-// BACKFILL / REPAIR FUNCTION (NON-DISRUPTIVE)
+// BACKFILL FUNCTION (NON-DISRUPTIVE)
 // ============================================================
-// - Does NOT touch your existing files.
-// - Does NOT create any special folders.
-// - Re-saves receipts (copies) into the normal YYYY/Month folders
-//   based on the parsed travel date.
-// - Uses a month filter based on CONFIG.backfillMode.
+// - Does NOT touch existing files.
+// - Does NOT create special folders.
+// - Re-saves PDFs into normal YYYY/Month folders based on parsed travel date.
+// - Optional mode to save ALL PDFs during backfill (recommended).
+// - Includes pagination + detailed logging.
 // ============================================================
 function backfillMonth() {
   var rootFolder = getOrCreateFolderSmart_(null, CONFIG.rootFolderName);
-
-  CONFIG.backfillMode = "CURRENT_MONTH";
-
+  backfillMode: "CURRENT_MONTH";
+  // IMPORTANT: do NOT override CONFIG.backfillMode in code.
+  // (Your earlier version forced CURRENT_MONTH, which stops February backfills later.)
 
   var targetInfo = getTargetMonthWindow_(CONFIG.backfillMode);
   var targetYear = targetInfo.year;
-  var targetMonth = targetInfo.month; // 0-11
+  var targetMonth = targetInfo.month;
   var targetMonthName = getMonthName_(targetMonth);
 
   var query =
@@ -166,110 +230,186 @@ function backfillMonth() {
     CONFIG.backfillSearchDaysBack +
     "d has:attachment";
 
-  var threads = GmailApp.search(query);
+  Logger.log("=== backfillMonth() starting ===");
+  Logger.log("Target month: " + targetMonthName + " " + targetYear + " (mode=" + CONFIG.backfillMode + ")");
+  Logger.log("Attachment mode: " + CONFIG.backfillAttachmentMode);
+  Logger.log("Gmail query: " + query);
 
-  if (threads.length === 0) {
-    Logger.log(
-      "No TrainPal emails found in the last " +
-        CONFIG.backfillSearchDaysBack +
-        " days."
-    );
-    return;
-  }
-
-  Logger.log(
-    "Backfill mode: " +
-      CONFIG.backfillMode +
-      " -> targeting " +
-      targetMonthName +
-      " " +
-      targetYear +
-      ". Scanning " +
-      threads.length +
-      " thread(s)..."
-  );
-
-  // Ensure target folders exist (normal structure)
+  // Ensure target folders exist
   var yearFolder = getOrCreateFolderSmart_(rootFolder, targetYear.toString());
   var monthFolder = getOrCreateFolderSmart_(yearFolder, targetMonthName);
 
-  var savedCount = 0;
+  var start = 0;
+  var totalThreads = 0;
+  var totalMessages = 0;
 
-  for (var t = 0; t < threads.length; t++) {
-    var messages = threads[t].getMessages();
+  var counters = makeCounters_();
+  var savedMap = {}; // messageId -> {subject, date, saved:[...], skipped:[...]}
 
-    for (var m = 0; m < messages.length; m++) {
-      var message = messages[m];
-      var subject = (message.getSubject() || "").toLowerCase();
-      var body = (message.getPlainBody() || "").toLowerCase();
-      var content = subject + " " + body;
+  while (true) {
+    var threads = GmailApp.search(query, start, CONFIG.pageSize);
+    if (!threads || threads.length === 0) break;
 
-      // Route filter still applies
-      if (
-        content.indexOf(CONFIG.routeKeywordA) === -1 ||
-        content.indexOf(CONFIG.routeKeywordB) === -1
-      ) {
-        continue;
-      }
+    totalThreads += threads.length;
+    Logger.log("Page: start=" + start + " threads=" + threads.length);
 
-      var messageDate = message.getDate();
-      var attachments = message.getAttachments();
+    for (var t = 0; t < threads.length; t++) {
+      var thread = threads[t];
+      var messages = thread.getMessages();
+      counters.threadsScanned++;
 
-      for (var a = 0; a < attachments.length; a++) {
-        var attachment = attachments[a];
-        var attachmentNameLower = (attachment.getName() || "").toLowerCase();
+      Logger.log("---- Thread #" + counters.threadsScanned + " messages=" + messages.length + " ----");
 
-        if (attachment.getContentType() !== "application/pdf") continue;
+      for (var m = 0; m < messages.length; m++) {
+        var message = messages[m];
+        totalMessages++;
+        counters.messagesScanned++;
 
+        var subjectRaw = message.getSubject() || "";
+        var subject = subjectRaw.toLowerCase();
+        var bodyRaw = message.getPlainBody() || "";
+        var body = bodyRaw.toLowerCase();
+        var content = subject + " " + body;
+
+        var msgDate = message.getDate();
+        var msgId = safeMessageId_(message);
+
+        ensureSavedMap_(savedMap, msgId, subjectRaw, msgDate);
+
+        Logger.log(
+          "[Message] id=" + msgId +
+          " date=" + msgDate +
+          " subject=\"" + subjectRaw + "\""
+        );
+
+        if (CONFIG.logBodySnippet) {
+          Logger.log("[Body snippet] " + bodyRaw.substring(0, 300).replace(/\s+/g, " "));
+        }
+
+        // Route filter
         if (
-          CONFIG.receiptKeyword &&
-          attachmentNameLower.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1
+          content.indexOf(CONFIG.routeKeywordA) === -1 ||
+          content.indexOf(CONFIG.routeKeywordB) === -1
         ) {
+          counters.skippedRoute++;
+          savedMap[msgId].skipped.push("Skipped message (route filter)");
+          Logger.log("  -> SKIP message: route keywords missing (" + CONFIG.routeKeywordA + ", " + CONFIG.routeKeywordB + ")");
           continue;
         }
 
-        var travelDate =
-          extractTravelDateFromAttachmentName_(attachment.getName(), messageDate) ||
-          extractTravelDateFromEmail_(message) ||
-          null;
+        var attachments = message.getAttachments();
+        Logger.log("  Attachments: " + attachments.length);
 
-        if (!travelDate) continue;
+        for (var a = 0; a < attachments.length; a++) {
+          var att = attachments[a];
+          var attName = att.getName() || "(no name)";
+          var attNameLower = attName.toLowerCase();
+          var attType = att.getContentType();
 
-        // Month filter (strict)
-        if (
-          travelDate.getFullYear() !== targetYear ||
-          travelDate.getMonth() !== targetMonth
-        ) {
-          continue;
+          if (attType !== "application/pdf") {
+            counters.skippedNonPdf++;
+            savedMap[msgId].skipped.push(attName + " (non-PDF: " + attType + ")");
+            Logger.log("  -> SKIP attachment: " + attName + " (non-PDF: " + attType + ")");
+            continue;
+          }
+
+          // Backfill attachment mode
+          if (CONFIG.backfillAttachmentMode === "RECEIPTS_ONLY") {
+            if (CONFIG.receiptKeyword && attNameLower.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1) {
+              counters.skippedKeyword++;
+              savedMap[msgId].skipped.push(attName + " (missing keyword: " + CONFIG.receiptKeyword + ")");
+              Logger.log("  -> SKIP attachment: " + attName + " (missing keyword: " + CONFIG.receiptKeyword + ")");
+              continue;
+            }
+          }
+
+          // Parse travel date (no email-date fallback here; we want a deterministic month)
+          var travelInfo = resolveTravelDateForBackfill_(attName, message, msgDate);
+          if (!travelInfo.date) {
+            counters.skippedNoDate++;
+            savedMap[msgId].skipped.push(attName + " (could not parse travel date)");
+            Logger.log("  -> SKIP attachment: " + attName + " (could not parse travel date)");
+            continue;
+          }
+
+          var travelDate = travelInfo.date;
+          var dateSource = travelInfo.source;
+
+          // Month filter
+          if (travelDate.getFullYear() !== targetYear || travelDate.getMonth() !== targetMonth) {
+            counters.skippedMonthMismatch++;
+            savedMap[msgId].skipped.push(attName + " (month mismatch: parsed " + (travelDate.getMonth()+1) + "/" + travelDate.getFullYear() + ")");
+            Logger.log(
+              "  -> SKIP attachment: " + attName +
+              " (month mismatch: parsed " + (travelDate.getMonth()+1) + "/" + travelDate.getFullYear() + ")"
+            );
+            continue;
+          }
+
+          // Save into target month folder
+          var fileName = buildFileName_(travelDate);
+          var uniqueNameInfo = getUniqueFileNameWithInfo_(monthFolder, fileName);
+
+          monthFolder.createFile(att.copyBlob().setName(uniqueNameInfo.name));
+          counters.saved++;
+          if (uniqueNameInfo.wasDuplicate) counters.duplicatesRenamed++;
+
+          var saveLine =
+            uniqueNameInfo.name +
+            " -> " +
+            CONFIG.rootFolderName + "/" + targetYear + "/" + targetMonthName +
+            " (travelDateSource=" + dateSource + ", originalAttachment=\"" + attName + "\"" +
+            (uniqueNameInfo.wasDuplicate ? ", dedupFrom=\"" + fileName + "\"" : "") +
+            ")";
+
+          savedMap[msgId].saved.push(saveLine);
+
+          Logger.log("  -> SAVED: " + saveLine);
         }
-
-        // Save into the normal month folder (no special folder)
-        var fileName = buildFileName_(travelDate);
-        fileName = getUniqueFileName_(monthFolder, fileName);
-
-        monthFolder.createFile(attachment.copyBlob().setName(fileName));
-        savedCount++;
       }
     }
+
+    start += CONFIG.pageSize;
   }
 
-  Logger.log(
-    "Backfill complete. Saved " +
-      savedCount +
-      " receipt(s) into normal folder: " +
-      CONFIG.rootFolderName +
-      "/" +
-      targetYear +
-      "/" +
-      targetMonthName
-  );
+  Logger.log("=== backfillMonth() finished ===");
+  logCounters_(counters, totalThreads, totalMessages);
+  logSavedMap_(savedMap);
 }
 
-// Returns the (year, month) pair for the target window.
+// ============================================================
+// DATE RESOLUTION (with source label for logging)
+// ============================================================
+
+function resolveTravelDateWithSource_(attachmentName, message, messageDate) {
+  var d1 = extractTravelDateFromAttachmentName_(attachmentName, messageDate);
+  if (d1) return { date: d1, source: "ATTACHMENT_NAME" };
+
+  var d2 = extractTravelDateFromEmail_(message);
+  if (d2) return { date: d2, source: "EMAIL_BODY" };
+
+  return { date: messageDate, source: "EMAIL_SENT_DATE" };
+}
+
+// Backfill: prefer attachment then email; if neither parsed, return null.
+// (We do NOT want to silently fall back to message sent date because it will mis-file across months.)
+function resolveTravelDateForBackfill_(attachmentName, message, messageDate) {
+  var d1 = extractTravelDateFromAttachmentName_(attachmentName, messageDate);
+  if (d1) return { date: d1, source: "ATTACHMENT_NAME" };
+
+  var d2 = extractTravelDateFromEmail_(message);
+  if (d2) return { date: d2, source: "EMAIL_BODY" };
+
+  return { date: null, source: "NONE" };
+}
+
+// ============================================================
+// TARGET MONTH WINDOW
+// ============================================================
 function getTargetMonthWindow_(mode) {
   var now = new Date();
   var y = now.getFullYear();
-  var m = now.getMonth(); // 0-11
+  var m = now.getMonth();
 
   if (mode === "PREVIOUS_MONTH") {
     m = m - 1;
@@ -285,7 +425,7 @@ function getTargetMonthWindow_(mode) {
 }
 
 // ============================================================
-// HELPERS
+// HELPERS (files/folders/naming)
 // ============================================================
 function buildFileName_(date) {
   var shortMonth = getShortMonthName_(date.getMonth());
@@ -293,68 +433,47 @@ function buildFileName_(date) {
   var dayNum = padZero_(date.getDate());
   var monthNum = padZero_(date.getMonth() + 1);
   var year = date.getFullYear();
-  return (
-    shortMonth +
-    " - " +
-    shortDay +
-    " - " +
-    dayNum +
-    "-" +
-    monthNum +
-    "-" +
-    year +
-    ".pdf"
-  );
+  return shortMonth + " - " + shortDay + " - " + dayNum + "-" + monthNum + "-" + year + ".pdf";
 }
 
-function getUniqueFileName_(folder, fileName) {
+function getUniqueFileNameWithInfo_(folder, fileName) {
   var baseName = fileName.replace(/\.pdf$/i, "");
   var candidate = fileName;
   var counter = 2;
+  var dup = false;
 
   while (folder.getFilesByName(candidate).hasNext()) {
+    dup = true;
     candidate = baseName + " (" + counter + ").pdf";
     counter++;
   }
-  return candidate;
+
+  return { name: candidate, wasDuplicate: dup };
+}
+
+function getUniqueFileName_(folder, fileName) {
+  return getUniqueFileNameWithInfo_(folder, fileName).name;
 }
 
 // PRIMARY date parsing: attachment filename
 function extractTravelDateFromAttachmentName_(filename, messageDate) {
   if (!filename) return null;
 
-  // Matches: "..._21_Feb_0655..." or "...-21-Feb-..."
-  var m = filename.match(
-    /\b(\d{1,2})[ _-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ _-]/i
-  );
+  // Matches: "..._21_Feb_0655..." or "...-21-Feb-..." or "... 21 Feb ..."
+  var m = filename.match(/\b(\d{1,2})[ _-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ _-]/i);
   if (!m) return null;
 
   var day = parseInt(m[1], 10);
-  var monStr =
-    m[2].substr(0, 1).toUpperCase() + m[2].substr(1, 2).toLowerCase();
-  var monthMap = {
-    Jan: 0,
-    Feb: 1,
-    Mar: 2,
-    Apr: 3,
-    May: 4,
-    Jun: 5,
-    Jul: 6,
-    Aug: 7,
-    Sep: 8,
-    Oct: 9,
-    Nov: 10,
-    Dec: 11,
-  };
+  var monStr = m[2].substr(0, 1).toUpperCase() + m[2].substr(1, 2).toLowerCase();
+  var monthMap = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
   var month = monthMap[monStr];
   if (month === undefined || isNaN(day)) return null;
 
   // Year heuristic from message date (handles year boundary)
   var year = messageDate.getFullYear();
   var msgMonth = messageDate.getMonth();
-
-  if (msgMonth === 11 && month === 0) year += 1; // Dec email, Jan travel
-  if (msgMonth === 0 && month === 11) year -= 1; // Jan email, Dec travel
+  if (msgMonth === 11 && month === 0) year += 1;
+  if (msgMonth === 0 && month === 11) year -= 1;
 
   return new Date(year, month, day, 12, 0, 0);
 }
@@ -365,32 +484,21 @@ function extractTravelDateFromEmail_(message) {
     .replace(/\s+/g, " ")
     .trim();
 
-  // Matches: "Sat, Feb 21, 2026"
-  var m = text.match(
-    /\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})\b/
-  );
-  if (!m) return null;
+  // Pattern 1: "Sat, Feb 21, 2026"
+  var m1 = text.match(/\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})\b/);
+  if (m1) return new Date(parseInt(m1[3], 10), monthIndex_(m1[1]), parseInt(m1[2], 10), 12, 0, 0);
 
-  var monthMap = {
-    Jan: 0,
-    Feb: 1,
-    Mar: 2,
-    Apr: 3,
-    May: 4,
-    Jun: 5,
-    Jul: 6,
-    Aug: 7,
-    Sep: 8,
-    Oct: 9,
-    Nov: 10,
-    Dec: 11,
-  };
-  var month = monthMap[m[1]];
-  var day = parseInt(m[2], 10);
-  var year = parseInt(m[3], 10);
+  // Pattern 2 (extra): "21 Feb 2026"
+  var m2 = text.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\b/);
+  if (m2) return new Date(parseInt(m2[3], 10), monthIndex_(m2[2]), parseInt(m2[1], 10), 12, 0, 0);
 
-  if (month === undefined || isNaN(day) || isNaN(year)) return null;
-  return new Date(year, month, day, 12, 0, 0);
+  return null;
+}
+
+function monthIndex_(monStr) {
+  var m = monStr.substr(0, 1).toUpperCase() + monStr.substr(1, 2).toLowerCase();
+  var map = { Jan:0, Feb:1, Mar:2, Apr:3, May:4, Jun:5, Jul:6, Aug:7, Sep:8, Oct:9, Nov:10, Dec:11 };
+  return map[m];
 }
 
 // Gmail label helper
@@ -404,8 +512,6 @@ function getOrCreateLabel_(labelName) {
 }
 
 // Folder getter that avoids duplicates due to casing/spacing differences.
-// It WON'T save you from an actual typo like "Februaru" already existing;
-// but it WILL stop "february" vs "February " creating a second folder.
 function getOrCreateFolderSmart_(parentFolder, folderName) {
   var desired = normaliseFolderName_(folderName);
 
@@ -451,6 +557,84 @@ function padZero_(num) {
 }
 
 // ============================================================
+// LOGGING HELPERS
+// ============================================================
+function makeCounters_() {
+  return {
+    threadsScanned: 0,
+    threadsLabelled: 0,
+    messagesScanned: 0,
+    saved: 0,
+    duplicatesRenamed: 0,
+    skippedRoute: 0,
+    skippedNonPdf: 0,
+    skippedKeyword: 0,
+    skippedNoDate: 0,
+    skippedMonthMismatch: 0,
+  };
+}
+
+function logCounters_(c, totalThreads, totalMessages) {
+  Logger.log("=== Summary ===");
+  Logger.log("Threads scanned: " + c.threadsScanned + " (approx total matched threads: " + totalThreads + ")");
+  Logger.log("Threads labelled: " + c.threadsLabelled);
+  Logger.log("Messages scanned: " + c.messagesScanned + " (approx total scanned messages: " + totalMessages + ")");
+  Logger.log("Saved PDFs: " + c.saved);
+  Logger.log("Duplicates renamed: " + c.duplicatesRenamed);
+  Logger.log("Skipped messages (route): " + c.skippedRoute);
+  Logger.log("Skipped attachments (non-PDF): " + c.skippedNonPdf);
+  Logger.log("Skipped attachments (keyword): " + c.skippedKeyword);
+  Logger.log("Skipped attachments (no travel date): " + c.skippedNoDate);
+  Logger.log("Skipped attachments (month mismatch): " + c.skippedMonthMismatch);
+}
+
+function ensureSavedMap_(savedMap, msgId, subject, dateObj) {
+  if (!savedMap[msgId]) {
+    savedMap[msgId] = {
+      subject: subject,
+      date: dateObj,
+      saved: [],
+      skipped: [],
+    };
+  }
+}
+
+function logSavedMap_(savedMap) {
+  Logger.log("=== Per-email saved/skipped map ===");
+  var keys = Object.keys(savedMap);
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    var rec = savedMap[k];
+    Logger.log("Email id=" + k + " date=" + rec.date + " subject=\"" + rec.subject + "\"");
+
+    if (rec.saved.length > 0) {
+      Logger.log("  SAVED (" + rec.saved.length + "):");
+      for (var s = 0; s < rec.saved.length; s++) Logger.log("    - " + rec.saved[s]);
+    } else {
+      Logger.log("  SAVED: none");
+    }
+
+    if (rec.skipped.length > 0) {
+      Logger.log("  SKIPPED (" + rec.skipped.length + "):");
+      for (var x = 0; x < rec.skipped.length; x++) Logger.log("    - " + rec.skipped[x]);
+    } else {
+      Logger.log("  SKIPPED: none");
+    }
+  }
+}
+
+// Some Apps Script environments don't expose a stable message ID;
+// this keeps logs readable without failing.
+function safeMessageId_(message) {
+  try {
+    // message.getId() exists in GmailApp Message objects
+    return message.getId();
+  } catch (e) {
+    return "unknown-id";
+  }
+}
+
+// ============================================================
 // SETUP: daily trigger
 // ============================================================
 function setupDailyTrigger() {
@@ -485,9 +669,5 @@ function resetProcessedEmails() {
     threads[t].removeLabel(label);
   }
 
-  Logger.log(
-    "Reset complete. Removed processed label from " +
-      threads.length +
-      " thread(s)."
-  );
+  Logger.log("Reset complete. Removed processed label from " + threads.length + " thread(s).");
 }
