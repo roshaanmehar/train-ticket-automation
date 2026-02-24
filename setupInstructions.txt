@@ -1,199 +1,463 @@
-================================================================
-  EMAIL ATTACHMENT COLLECTOR - SETUP GUIDE
-  (Estimated time: 5 minutes)
-================================================================
+// ============================================================
+// TRAIN TICKET COLLECTOR - Google Apps Script
+// ============================================================
+// Collects TrainPal PDF receipts from Gmail and saves to Drive.
+// Naming date logic:
+//   1) PRIMARY: parse travel date from ATTACHMENT filename (Option 2)
+//   2) FALLBACK: parse travel date from EMAIL body/subject
+//   3) FINAL fallback: email sent date
+//
+// Also includes a "repair" function that goes one month back,
+// creates a new reconciliation folder, and re-saves last month's
+// receipts into it with corrected naming.
+// ============================================================
 
-WHAT THIS DOES:
-  Every day, this script checks your Gmail for emails from a
-  specific sender, optionally filters for messages containing
-  two keywords (e.g. a route or topic), downloads matching PDF
-  attachments (optionally filtered by filename keyword), and
-  saves them into Google Drive in organised folders like:
+// ----- CONFIGURATION -----
+var CONFIG = {
+  senderEmail: "tp-accounts-noreply@trainpal.com",
+  rootFolderName: "Train Tickets",
+  processedLabelName: "TrainTicket-Processed",
 
-    Email Attachments / 2026 / February / Feb - Sat - 07-02-2026.pdf
+  // Route filter: both must appear (subject/body)
+  routeKeywordA: "leeds",
+  routeKeywordB: "hull",
 
-  At the end of the month, you can download the folder and
-  share it with whoever needs the documents.
+  // Only save PDF attachments containing this word in filename.
+  // Set to "" to save all PDF attachments from matching emails.
+  receiptKeyword: "receipt",
 
+  // For the "repair" function: how far back to look in Gmail
+  // (keeps it efficient; adjust if you book further ahead)
+  repairSearchDaysBack: 90,
+};
 
-================================================================
-STEP 1: OPEN GOOGLE APPS SCRIPT
-================================================================
+// ============================================================
+// MAIN FUNCTION - Run manually or via daily trigger
+// ============================================================
+function collectTrainTickets() {
+  var label = getOrCreateLabel_(CONFIG.processedLabelName);
+  var rootFolder = getOrCreateFolderSmart_(null, CONFIG.rootFolderName);
 
-  1. Open your web browser (Chrome recommended)
-  2. Go to: https://script.google.com
-  3. Sign in with the SAME Google account that has access to
-     the Gmail inbox you want to monitor
-  4. Click the "+ New project" button
+  var query =
+    "from:" +
+    CONFIG.senderEmail +
+    " -label:" +
+    CONFIG.processedLabelName +
+    " has:attachment";
 
+  var threads = GmailApp.search(query);
 
-================================================================
-STEP 2: PASTE THE SCRIPT
-================================================================
+  if (threads.length === 0) {
+    Logger.log("No new TrainPal emails found.");
+    return;
+  }
 
-  1. You’ll see a code editor with some default text like:
-       function myFunction() { }
-  2. DELETE all of that text (select all, then delete)
-  3. Open the script file you intend to use (for example:
-     "AttachmentCollector.gs")
-  4. Copy EVERYTHING in that file (Ctrl+A, then Ctrl+C)
-  5. Paste it into the Google Apps Script editor (Ctrl+V)
-  6. Click the floppy disk icon (or Ctrl+S) to save
-  7. Optional: rename the project by clicking "Untitled project"
-     at the top and typing something like:
-       "Email Attachment Collector"
+  Logger.log("Found " + threads.length + " new email thread(s) to process.");
 
+  var savedCount = 0;
 
-================================================================
-STEP 3: TEST THE SEARCH (without saving anything yet)
-================================================================
+  for (var t = 0; t < threads.length; t++) {
+    var messages = threads[t].getMessages();
 
-  This step lets you verify the script can find relevant emails
-  before it starts saving files.
+    for (var m = 0; m < messages.length; m++) {
+      var message = messages[m];
+      var subject = (message.getSubject() || "").toLowerCase();
+      var body = (message.getPlainBody() || "").toLowerCase();
+      var content = subject + " " + body;
 
-  1. In the editor’s top toolbar, find the function dropdown
-     (it will show a function name) and click it
-  2. Select the test function (for example):
-       testSearchWithoutProcessing
-  3. Click the "Run" button (play/triangle icon)
-  4. A popup may appear saying "Authorisation required"
-     -- click "Review permissions"
-  5. Select your Google account
-  6. You may see a "Google hasn’t verified this app" warning:
-     a. Click "Advanced"
-     b. Click "Go to [project name] (unsafe)"
-     c. Click "Allow"
-     (This is expected for personal Apps Script projects.)
+      // Route filter
+      if (
+        content.indexOf(CONFIG.routeKeywordA) === -1 ||
+        content.indexOf(CONFIG.routeKeywordB) === -1
+      ) {
+        Logger.log("Skipping email (route filter): " + message.getSubject());
+        continue;
+      }
 
-  7. The script will run. Look at the bottom of the screen for
-     the "Execution log" panel
-  8. You should see a list of emails, showing:
-     - Subject line
-     - Date
-     - Whether it matched the keyword filter (YES/NO, if enabled)
-     - Attachment names and types
+      var messageDate = message.getDate();
+      var attachments = message.getAttachments();
 
-  CHECK THE OUTPUT:
-    - Do you see emails listed?
-    - If you enabled keyword filtering, do relevant emails show
-      "Keyword match: YES"?
-    - Is there a PDF attachment matching your attachment-name
-      keyword (if enabled)?
+      for (var a = 0; a < attachments.length; a++) {
+        var attachment = attachments[a];
+        var attachmentName = (attachment.getName() || "").toLowerCase();
 
-  If attachment names don’t include your expected word, edit the
-  CONFIG section in the script:
-    attachmentNameKeyword: "receipt"
-  Change "receipt" to a keyword that appears in your attachment
-  filenames, or set it to "" to save ALL PDF attachments.
+        if (attachment.getContentType() !== "application/pdf") continue;
 
+        if (
+          CONFIG.receiptKeyword &&
+          attachmentName.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1
+        ) {
+          Logger.log(
+            'Skipping attachment (no "' +
+              CONFIG.receiptKeyword +
+              '" in name): ' +
+              attachment.getName()
+          );
+          continue;
+        }
 
-================================================================
-STEP 4: RUN IT FOR REAL (first time)
-================================================================
+        // ----- Travel date resolution -----
+        // 1) Attachment filename (primary)
+        // 2) Email body/subject (fallback)
+        // 3) Message date (final fallback)
+        var travelDate =
+          extractTravelDateFromAttachmentName_(attachment.getName(), messageDate) ||
+          extractTravelDateFromEmail_(message) ||
+          messageDate;
 
-  1. Change the function dropdown back to the main function
-     (for example):
-       collectAttachments
-  2. Click "Run"
-  3. Wait for it to finish (check the execution log)
-  4. Open Google Drive: https://drive.google.com
-  5. You should see a new folder (for example "Email Attachments")
-     with your PDFs organised inside
+        // Folder path: Train Tickets / YYYY / MonthName
+        var yearFolder = getOrCreateFolderSmart_(
+          rootFolder,
+          travelDate.getFullYear().toString()
+        );
+        var monthName = getMonthName_(travelDate.getMonth());
+        var monthFolder = getOrCreateFolderSmart_(yearFolder, monthName);
 
+        // Filename: Feb - Mon - 23-02-2026.pdf
+        var fileName = buildFileName_(travelDate);
+        fileName = getUniqueFileName_(monthFolder, fileName);
 
-================================================================
-STEP 5: SET UP THE DAILY AUTO-RUN
-================================================================
+        monthFolder.createFile(attachment.copyBlob().setName(fileName));
+        savedCount++;
+        Logger.log("Saved: " + fileName + " to " + monthName + "/");
+      }
+    }
 
-  This makes it run every day automatically.
+    threads[t].addLabel(label);
+  }
 
-  1. Change the function dropdown to:
-       setupDailyTrigger
-  2. Click "Run"
-  3. Done — the script will now run automatically every day
-     around the configured hour.
+  Logger.log("Done! Saved " + savedCount + " receipt(s) to Google Drive.");
+}
 
-  To verify the trigger was created:
-  1. Click the clock icon on the left sidebar ("Triggers")
-  2. You should see one trigger listed for the main collection
-     function, set to run daily
+// ============================================================
+// REPAIR FUNCTION (ONE MONTH BACK)
+// ============================================================
+// What it does:
+// - Targets the previous calendar month (relative to today).
+// - Creates a NEW reconciliation folder under:
+//     Train Tickets / YYYY / "Reconciled - <Month> <Year>"
+// - Searches TrainPal emails from the last N days (CONFIG.repairSearchDaysBack)
+// - For each matching receipt attachment whose parsed travel date is in the target month,
+//   it saves it into the reconciliation folder using the corrected name.
+// - Does NOT delete or move existing files (safe).
+// ============================================================
+function repairPreviousMonth() {
+  var now = new Date();
+  var target = new Date(now.getFullYear(), now.getMonth() - 1, 1, 12, 0, 0); // previous month, day 1
+  var targetYear = target.getFullYear();
+  var targetMonth = target.getMonth(); // 0-11
+  var targetMonthName = getMonthName_(targetMonth);
 
+  var rootFolder = getOrCreateFolderSmart_(null, CONFIG.rootFolderName);
+  var yearFolder = getOrCreateFolderSmart_(rootFolder, targetYear.toString());
 
-================================================================
-STEP 6: DOWNLOADING AT END OF MONTH
-================================================================
+  var reconciliationFolderName = "Reconciled - " + targetMonthName + " " + targetYear;
+  var reconFolder = getOrCreateFolderSmart_(yearFolder, reconciliationFolderName);
 
-  When you need to export the saved PDFs:
+  // Gmail query: keep it bounded for performance; adjust if you book further ahead
+  var query =
+    "from:" +
+    CONFIG.senderEmail +
+    " newer_than:" +
+    CONFIG.repairSearchDaysBack +
+    "d has:attachment";
 
-  1. Go to Google Drive: https://drive.google.com
-  2. Open: [Root Folder] > [Year] > [Month]
-     For example: Email Attachments > 2026 > February
-  3. Right-click the month folder (e.g. "February")
-  4. Click "Download"
-  5. Google Drive will zip all the PDFs into one file and
-     download it to your computer
-  6. Share the zip file (or extract and share the PDFs) as needed
+  var threads = GmailApp.search(query);
 
+  if (threads.length === 0) {
+    Logger.log("No TrainPal emails found in the last " + CONFIG.repairSearchDaysBack + " days.");
+    return;
+  }
 
-================================================================
-TROUBLESHOOTING
-================================================================
+  Logger.log(
+    "Repair mode: scanning " +
+      threads.length +
+      " thread(s) for travel dates in " +
+      targetMonthName +
+      " " +
+      targetYear +
+      "..."
+  );
 
-  "I don't see any emails being found"
-    - Make sure you’re signed into the Google account that has
-      access to the inbox you want to monitor
-    - Check the sender email in the CONFIG matches the actual
-      sender address for the emails you want to capture
+  var savedCount = 0;
 
-  "Emails are found but no PDFs are saved"
-    - The keyword filter might not be matching (if enabled).
-      Run the test function and check whether "Keyword match"
-      says YES for relevant emails
-    - The attachment-name keyword might not match (if enabled).
-      Check actual attachment filenames and update
-      attachmentNameKeyword, or set it to "" to save all PDFs
+  for (var t = 0; t < threads.length; t++) {
+    var messages = threads[t].getMessages();
 
-  "I want to reprocess emails that were already processed"
-    - Run:
-        resetProcessedEmails
-    - Then run the main collection function again
+    for (var m = 0; m < messages.length; m++) {
+      var message = messages[m];
+      var subject = (message.getSubject() || "").toLowerCase();
+      var body = (message.getPlainBody() || "").toLowerCase();
+      var content = subject + " " + body;
 
-  "I want to stop the daily auto-run"
-    - Click the clock icon on the left sidebar ("Triggers")
-    - Click the three dots on the trigger
-    - Click "Delete trigger"
+      // Route filter still applies
+      if (
+        content.indexOf(CONFIG.routeKeywordA) === -1 ||
+        content.indexOf(CONFIG.routeKeywordB) === -1
+      ) {
+        continue;
+      }
 
-  "I accidentally ran it twice and got duplicate files"
-    - The script applies a processed label so it should not
-      reprocess the same threads.
-    - If duplicates exist, delete them from Drive, run
-      resetProcessedEmails, then run the main function again.
+      var messageDate = message.getDate();
+      var attachments = message.getAttachments();
 
+      for (var a = 0; a < attachments.length; a++) {
+        var attachment = attachments[a];
+        var attachmentName = (attachment.getName() || "").toLowerCase();
 
-================================================================
-OPTIONAL: SYNC TO A DESKTOP COMPUTER
-================================================================
+        if (attachment.getContentType() !== "application/pdf") continue;
 
-  If you want the Drive folder to appear on your computer as a
-  regular folder:
+        if (
+          CONFIG.receiptKeyword &&
+          attachmentName.indexOf(CONFIG.receiptKeyword.toLowerCase()) === -1
+        ) {
+          continue;
+        }
 
-  1. Install Google Drive for desktop:
-     https://www.google.com/drive/download/
-  2. Sign in with your Google account
-  3. Your Drive folders will appear in your file explorer
-     (location depends on your operating system settings)
-  4. New PDFs saved by the script will sync automatically
+        var travelDate =
+          extractTravelDateFromAttachmentName_(attachment.getName(), messageDate) ||
+          extractTravelDateFromEmail_(message) ||
+          null;
 
+        if (!travelDate) continue;
 
-================================================================
-DONE
-================================================================
+        if (travelDate.getFullYear() !== targetYear || travelDate.getMonth() !== targetMonth) {
+          continue;
+        }
 
-  Summary:
-  - A script that runs daily
-  - Checks Gmail for new matching emails
-  - Saves matching PDF attachments to Google Drive, organised
-  - You download the monthly folder when needed
+        var fileName = buildFileName_(travelDate);
+        fileName = getUniqueFileName_(reconFolder, fileName);
 
-  You only need to revisit Google Apps Script if something
-  changes (e.g. sender address, email format, or attachment names).
+        reconFolder.createFile(attachment.copyBlob().setName(fileName));
+        savedCount++;
+      }
+    }
+  }
+
+  Logger.log(
+    "Repair complete. Saved " +
+      savedCount +
+      " corrected receipt(s) into: " +
+      targetYear +
+      "/" +
+      reconciliationFolderName
+  );
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function buildFileName_(date) {
+  var shortMonth = getShortMonthName_(date.getMonth());
+  var shortDay = getShortDayName_(date.getDay());
+  var dayNum = padZero_(date.getDate());
+  var monthNum = padZero_(date.getMonth() + 1);
+  var year = date.getFullYear();
+
+  return shortMonth + " - " + shortDay + " - " + dayNum + "-" + monthNum + "-" + year + ".pdf";
+}
+
+function getUniqueFileName_(folder, fileName) {
+  var baseName = fileName.replace(/\.pdf$/i, "");
+  var candidate = fileName;
+  var counter = 2;
+
+  while (folder.getFilesByName(candidate).hasNext()) {
+    candidate = baseName + " (" + counter + ").pdf";
+    counter++;
+  }
+
+  return candidate;
+}
+
+// --- Date parsing (PRIMARY): attachment filename ---
+function extractTravelDateFromAttachmentName_(filename, messageDate) {
+  if (!filename) return null;
+
+  // Common TrainPal-ish pattern: "..._21_Feb_0655.pdf"
+  // Also handles: "...-21-Feb-0655.pdf" etc.
+  var m = filename.match(/\b(\d{1,2})[ _-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[ _-]/i);
+  if (!m) return null;
+
+  var day = parseInt(m[1], 10);
+  var monStr = m[2].substr(0, 1).toUpperCase() + m[2].substr(1, 2).toLowerCase();
+  var monthMap = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  var month = monthMap[monStr];
+  if (month === undefined || isNaN(day)) return null;
+
+  // Year heuristic from message date (handles year boundary)
+  var year = messageDate.getFullYear();
+  var msgMonth = messageDate.getMonth();
+
+  // If message is Dec and travel is Jan -> next year
+  if (msgMonth === 11 && month === 0) year += 1;
+  // If message is Jan and travel is Dec -> previous year (rare, but symmetric)
+  if (msgMonth === 0 && month === 11) year -= 1;
+
+  // Midday avoids DST/timezone rollover surprises
+  return new Date(year, month, day, 12, 0, 0);
+}
+
+// --- Date parsing (FALLBACK): email subject/body ---
+function extractTravelDateFromEmail_(message) {
+  var text = ((message.getSubject() || "") + " " + (message.getPlainBody() || ""))
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Matches: "Sat, Feb 21, 2026"
+  var m = text.match(/\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat),\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})\b/);
+  if (!m) return null;
+
+  var monthMap = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  var month = monthMap[m[1]];
+  var day = parseInt(m[2], 10);
+  var year = parseInt(m[3], 10);
+
+  if (month === undefined || isNaN(day) || isNaN(year)) return null;
+  return new Date(year, month, day, 12, 0, 0);
+}
+
+// --- Folder + label helpers ---
+function getOrCreateLabel_(labelName) {
+  var label = GmailApp.getUserLabelByName(labelName);
+  if (!label) {
+    label = GmailApp.createLabel(labelName);
+    Logger.log('Created Gmail label: "' + labelName + '"');
+  }
+  return label;
+}
+
+// SMART folder getter:
+// - avoids creating duplicate month folders when casing/spacing differs
+// - e.g. "February" vs " february "
+// - also helps prevent accidental typos creating new folders
+function getOrCreateFolderSmart_(parentFolder, folderName) {
+  var desired = normaliseFolderName_(folderName);
+
+  // Enumerate existing folders under the parent and do a normalised match.
+  var it = parentFolder ? parentFolder.getFolders() : DriveApp.getFolders();
+  while (it.hasNext()) {
+    var f = it.next();
+    if (normaliseFolderName_(f.getName()) === desired) {
+      return f;
+    }
+  }
+
+  // Not found -> create with canonical name
+  if (parentFolder) {
+    Logger.log('Created folder: "' + folderName + '"');
+    return parentFolder.createFolder(folderName);
+  } else {
+    Logger.log('Created root folder: "' + folderName + '"');
+    return DriveApp.createFolder(folderName);
+  }
+}
+
+function normaliseFolderName_(name) {
+  return (name || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// --- Date formatting helpers ---
+function getMonthName_(monthIndex) {
+  var months = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+  ];
+  return months[monthIndex];
+}
+
+function getShortMonthName_(monthIndex) {
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return months[monthIndex];
+}
+
+function getShortDayName_(dayIndex) {
+  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return days[dayIndex];
+}
+
+function padZero_(num) {
+  return num < 10 ? "0" + num : num.toString();
+}
+
+// ============================================================
+// SETUP: daily trigger (same as before)
+// ============================================================
+function setupDailyTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "collectTrainTickets") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+
+  ScriptApp.newTrigger("collectTrainTickets")
+    .timeBased()
+    .everyDays(1)
+    .atHour(8)
+    .create();
+
+  Logger.log("Daily trigger created! Runs every day between 8-9 AM.");
+}
+
+// ============================================================
+// OPTIONAL UTILITIES
+// ============================================================
+
+// Test search (no processing label changes)
+function testSearchWithoutProcessing() {
+  var query = "from:" + CONFIG.senderEmail + " has:attachment";
+  var threads = GmailApp.search(query);
+
+  Logger.log("Total TrainPal emails with attachments: " + threads.length);
+
+  for (var t = 0; t < threads.length; t++) {
+    var messages = threads[t].getMessages();
+    for (var m = 0; m < messages.length; m++) {
+      var message = messages[m];
+      var content = ((message.getSubject() || "") + " " + (message.getPlainBody() || "")).toLowerCase();
+
+      var routeMatch =
+        content.indexOf(CONFIG.routeKeywordA) !== -1 &&
+        content.indexOf(CONFIG.routeKeywordB) !== -1;
+
+      var attachments = message.getAttachments();
+      var attachmentNames = [];
+      for (var a = 0; a < attachments.length; a++) {
+        attachmentNames.push(attachments[a].getName() + " (" + attachments[a].getContentType() + ")");
+      }
+
+      Logger.log(
+        "---\n" +
+          "Subject: " + message.getSubject() + "\n" +
+          "Message date: " + message.getDate() + "\n" +
+          "Route match: " + (routeMatch ? "YES" : "NO") + "\n" +
+          "Attachments: " + attachmentNames.join(", ")
+      );
+    }
+  }
+}
+
+// Remove processed label from all threads (global reset)
+function resetProcessedEmails() {
+  var label = GmailApp.getUserLabelByName(CONFIG.processedLabelName);
+  if (!label) {
+    Logger.log("No processed label found. Nothing to reset.");
+    return;
+  }
+
+  var threads = label.getThreads();
+  for (var t = 0; t < threads.length; t++) {
+    threads[t].removeLabel(label);
+  }
+
+  Logger.log(
+    "Reset complete. Removed processed label from " +
+      threads.length +
+      " thread(s). Run collectTrainTickets() again to reprocess."
+  );
+}
